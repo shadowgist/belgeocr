@@ -1,3 +1,4 @@
+import gc
 import os
 
 import pytest
@@ -7,6 +8,7 @@ pytest.importorskip("PySide6")
 
 from docx import Document  # noqa: E402
 from openpyxl import load_workbook  # noqa: E402
+from PySide6.QtCore import QEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from belgeocr import loader  # noqa: E402
@@ -27,7 +29,12 @@ def window(app, monkeypatch, tmp_path):
     monkeypatch.setattr(w, "_on_error", lambda msg: pytest.fail(msg))
     w.saved = saved
     yield w
+    _wait(QApplication.instance(), w)
     w.close()
+    w.deleteLater()
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    QApplication.processEvents()
+    gc.collect()
 
 
 def _wait(app, window):
