@@ -1,0 +1,77 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-tur fonts-dejavu-core
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+      - name: Bundle Tesseract
+        shell: pwsh
+        run: ./packaging/fetch_tesseract.ps1 -Destination "$env:GITHUB_WORKSPACE\packaging\tesseract"
+      - name: Tests
+        env:
+          BELGEOCR_TESSERACT: ${{ github.workspace }}\packaging\tesseract\tesseract.exe
+        run: pytest -q
+      - name: PyInstaller
+        run: pyinstaller --noconfirm packaging/belgeocr.spec
+      - name: Copy Tesseract into app
+        shell: pwsh
+        run: Copy-Item packaging\tesseract dist\BelgeOCR\tesseract -Recurse
+      - name: Smoke test frozen app
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\BelgeOCR\BelgeOCR.exe -PassThru
+          Start-Sleep 15
+          if ($p.HasExited) { throw "BelgeOCR.exe exited early with code $($p.ExitCode)" }
+          Stop-Process $p
+      - name: Version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = python -c "import belgeocr; print(belgeocr.__version__)"
+          "version=$v" >> $env:GITHUB_OUTPUT
+      - name: Zip portable build
+        shell: pwsh
+        run: Compress-Archive dist\BelgeOCR "dist\BelgeOCR-portable-${{ steps.ver.outputs.version }}.zip"
+      - name: Installer
+        shell: pwsh
+        env:
+          BELGEOCR_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\installer.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BelgeOCR-windows
+          path: |
+            dist/BelgeOCR-Setup-*.exe
+            dist/BelgeOCR-portable-*.zip
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/BelgeOCR-Setup-*.exe
+            dist/BelgeOCR-portable-*.zip
