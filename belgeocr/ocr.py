@@ -180,10 +180,29 @@ def _text_only_pdf(img: Image.Image, options: OcrOptions) -> bytes:
     )
 
 
-def _image_pdf(img: Image.Image, options: OcrOptions) -> bytes:
-    """Return a one-page PDF with the page image plus an invisible text layer."""
-    dpi = img.info.get("dpi", (options.dpi, options.dpi))[0]
-    return tesseract_setup.run_image(img, options.lang, options.psm, dpi, "pdf")
+def _image_page(img: Image.Image):
+    """Return a PDF page showing ``img`` at its DPI."""
+    dpi = img.info.get("dpi", (300, 300))[0]
+    buf = io.BytesIO()
+    img.save(buf, format="PDF", resolution=float(dpi), quality=90)
+    buf.seek(0)
+    return PdfReader(buf).pages[0]
+
+
+def _overlay_text(page, img: Image.Image, options: OcrOptions) -> None:
+    """Merge an invisible OCR text layer for ``img`` onto ``page``.
+
+    Tesseract only produces the text layer; it never has to write the page
+    image itself (its JPEG temp files break on non-ASCII %TEMP% on Windows).
+    """
+    text_page = PdfReader(io.BytesIO(_text_only_pdf(img, options))).pages[0]
+    page.transfer_rotation_to_content()
+    box = page.cropbox
+    sx = float(box.width) / float(text_page.mediabox.width)
+    sy = float(box.height) / float(text_page.mediabox.height)
+    page.merge_transformed_page(
+        text_page, Transformation().scale(sx, sy).translate(float(box.left), float(box.bottom))
+    )
 
 
 def make_searchable_pdf(
@@ -214,24 +233,14 @@ def make_searchable_pdf(
                 writer.add_page(page)
                 continue
             img = loader.load_page(src, index, options.dpi)
-            text_pdf = PdfReader(io.BytesIO(_text_only_pdf(img, options)))
-            text_page = text_pdf.pages[0]
-            page = writer.add_page(page)
-            page.transfer_rotation_to_content()
-            box = page.cropbox
-            sx = float(box.width) / float(text_page.mediabox.width)
-            sy = float(box.height) / float(text_page.mediabox.height)
-            transform = Transformation().scale(sx, sy).translate(
-                float(box.left), float(box.bottom)
-            )
-            page.merge_transformed_page(text_page, transform)
+            _overlay_text(writer.add_page(page), img, options)
     else:
         for index in range(total):
             _check_cancel(cancel)
             if progress:
                 progress(index, total, f"Sayfa {index + 1}/{total} işleniyor...")
             img = preprocess(loader.load_page(src, index, options.dpi), options.deskew)
-            writer.append(PdfReader(io.BytesIO(_image_pdf(img, options))))
+            _overlay_text(writer.add_page(_image_page(img)), img, options)
 
     _check_cancel(cancel)
     dst.parent.mkdir(parents=True, exist_ok=True)
