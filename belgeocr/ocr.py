@@ -10,11 +10,10 @@ from typing import Callable
 
 import cv2
 import numpy as np
-import pytesseract
 from PIL import Image
 from pypdf import PdfReader, PdfWriter, Transformation
 
-from belgeocr import loader
+from belgeocr import loader, tesseract_setup
 
 ProgressFn = Callable[[int, int, str], None]
 CancelFn = Callable[[], bool]
@@ -121,20 +120,11 @@ def preprocess(img: Image.Image, deskew: bool = True) -> Image.Image:
     return out
 
 
-def _config(dpi: int, psm: int) -> str:
-    return f"--psm {psm} --dpi {dpi}"
-
-
 def ocr_image(img: Image.Image, options: OcrOptions | None = None) -> OcrPage:
     options = options or OcrOptions()
     prepared = preprocess(img, options.deskew)
     dpi = prepared.info["dpi"][0]
-    data = pytesseract.image_to_data(
-        prepared,
-        lang=options.lang,
-        config=_config(dpi, options.psm),
-        output_type=pytesseract.Output.DICT,
-    )
+    data = tesseract_setup.image_to_data(prepared, options.lang, options.psm, dpi)
     paragraphs: dict[tuple[int, int], OcrParagraph] = {}
     lines: dict[tuple[int, int, int], list[tuple[str, int]]] = {}
     confs: list[float] = []
@@ -185,19 +175,33 @@ def ocr_file(
 def _text_only_pdf(img: Image.Image, options: OcrOptions) -> bytes:
     """Return a one-page PDF containing only the invisible OCR text layer."""
     dpi = img.info.get("dpi", (options.dpi, options.dpi))[0]
-    return pytesseract.image_to_pdf_or_hocr(
-        img,
-        lang=options.lang,
-        extension="pdf",
-        config=_config(dpi, options.psm) + " -c textonly_pdf=1",
+    return tesseract_setup.run_image(
+        img, options.lang, options.psm, dpi, "pdf", ["-c", "textonly_pdf=1"]
     )
 
 
-def _image_pdf(img: Image.Image, options: OcrOptions) -> bytes:
-    """Return a one-page PDF with the page image plus an invisible text layer."""
-    dpi = img.info.get("dpi", (options.dpi, options.dpi))[0]
-    return pytesseract.image_to_pdf_or_hocr(
-        img, lang=options.lang, extension="pdf", config=_config(dpi, options.psm)
+def _image_page(img: Image.Image):
+    """Return a PDF page showing ``img`` at its DPI."""
+    dpi = img.info.get("dpi", (300, 300))[0]
+    buf = io.BytesIO()
+    img.save(buf, format="PDF", resolution=float(dpi), quality=90)
+    buf.seek(0)
+    return PdfReader(buf).pages[0]
+
+
+def _overlay_text(page, img: Image.Image, options: OcrOptions) -> None:
+    """Merge an invisible OCR text layer for ``img`` onto ``page``.
+
+    Tesseract only produces the text layer; it never has to write the page
+    image itself (its JPEG temp files break on non-ASCII %TEMP% on Windows).
+    """
+    text_page = PdfReader(io.BytesIO(_text_only_pdf(img, options))).pages[0]
+    page.transfer_rotation_to_content()
+    box = page.cropbox
+    sx = float(box.width) / float(text_page.mediabox.width)
+    sy = float(box.height) / float(text_page.mediabox.height)
+    page.merge_transformed_page(
+        text_page, Transformation().scale(sx, sy).translate(float(box.left), float(box.bottom))
     )
 
 
@@ -229,24 +233,14 @@ def make_searchable_pdf(
                 writer.add_page(page)
                 continue
             img = loader.load_page(src, index, options.dpi)
-            text_pdf = PdfReader(io.BytesIO(_text_only_pdf(img, options)))
-            text_page = text_pdf.pages[0]
-            page = writer.add_page(page)
-            page.transfer_rotation_to_content()
-            box = page.cropbox
-            sx = float(box.width) / float(text_page.mediabox.width)
-            sy = float(box.height) / float(text_page.mediabox.height)
-            transform = Transformation().scale(sx, sy).translate(
-                float(box.left), float(box.bottom)
-            )
-            page.merge_transformed_page(text_page, transform)
+            _overlay_text(writer.add_page(page), img, options)
     else:
         for index in range(total):
             _check_cancel(cancel)
             if progress:
                 progress(index, total, f"Sayfa {index + 1}/{total} işleniyor...")
             img = preprocess(loader.load_page(src, index, options.dpi), options.deskew)
-            writer.append(PdfReader(io.BytesIO(_image_pdf(img, options))))
+            _overlay_text(writer.add_page(_image_page(img)), img, options)
 
     _check_cancel(cancel)
     dst.parent.mkdir(parents=True, exist_ok=True)
