@@ -13,7 +13,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv if argv is None else argv
     app = QApplication(argv)
     app.setApplicationName(APP_NAME)
-    app.setStyle("Fusion")
+    app.setOrganizationName(APP_NAME)
     icon = resource_path("icon.png")
     if icon.exists():
         app.setWindowIcon(QIcon(str(icon)))
@@ -26,6 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     window.show()
     if tesseract_error:
         QMessageBox.warning(window, APP_NAME, tesseract_error)
-    for path in argv[1:]:
-        window.add_files([path])
+    files = [p for p in argv[1:] if not p.startswith("-")]
+    if files:
+        window.open_files(files)
     return app.exec()

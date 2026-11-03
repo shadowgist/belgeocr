@@ -35,6 +35,29 @@ class Table:
     cells: list[Cell] = field(default_factory=list)
     page: int = 0
     ruled: bool = True
+    last_page: int | None = None
+    source: str = "ocr"  # "ocr" or "ai"
+
+    @property
+    def end_page(self) -> int:
+        return self.page if self.last_page is None else self.last_page
+
+    @property
+    def page_label(self) -> str:
+        if self.end_page != self.page:
+            return f"{self.page + 1}-{self.end_page + 1}"
+        return str(self.page + 1)
+
+    @classmethod
+    def from_grid(cls, rows: list[list[str]], page: int = 0, ruled: bool = True,
+                  source: str = "ocr") -> "Table":
+        n_cols = max((len(r) for r in rows), default=0)
+        cells = [
+            Cell(r, c, (row[c] if c < len(row) else "") or "")
+            for r, row in enumerate(rows)
+            for c in range(n_cols)
+        ]
+        return cls((0, 0, 0, 0), len(rows), n_cols, cells, page, ruled, source=source)
 
     def to_grid(self) -> list[list[str]]:
         grid = [["" for _ in range(self.n_cols)] for _ in range(self.n_rows)]
@@ -341,6 +364,58 @@ def extract_tables_from_file(
     return found
 
 
+def _norm_row(table: Table, row: int) -> tuple[str, ...]:
+    grid = table.to_grid()
+    return tuple(" ".join(v.lower().split()) for v in grid[row]) if table.n_rows > row else ()
+
+
+def merge_tables(tables: list[Table]) -> list[Table]:
+    """Join tables that continue on the next page.
+
+    A table is appended to the previous one when it is the first table of the
+    page right after the previous table's last page, the previous table ends
+    its page, and both have the same column count. A repeated header row is
+    dropped. Input tables are not modified.
+    """
+    ordered = sorted(tables, key=lambda t: t.page)
+    first_on_page: dict[int, Table] = {}
+    last_on_page: dict[int, Table] = {}
+    for t in ordered:
+        first_on_page.setdefault(t.page, t)
+        last_on_page[t.page] = t
+    merged: list[Table] = []
+    tail: dict[int, Table] = {}  # id(merged table) -> last original table in it
+    for t in ordered:
+        prev = merged[-1] if merged else None
+        if (
+            prev is not None
+            and t.page == prev.end_page + 1
+            and t.n_cols == prev.n_cols
+            and first_on_page[t.page] is t
+            and last_on_page[prev.end_page] is tail[id(prev)]
+        ):
+            header = _norm_row(t, 0)
+            skip_header = t.n_rows > 1 and any(header) and header == _norm_row(prev, 0)
+            offset = prev.n_rows - (1 if skip_header else 0)
+            for cell in t.cells:
+                if not (skip_header and cell.row == 0):
+                    prev.cells.append(
+                        Cell(cell.row + offset, cell.col, cell.text, cell.rowspan, cell.colspan)
+                    )
+            prev.n_rows = offset + t.n_rows
+            prev.last_page = t.page
+            tail[id(prev)] = t
+            continue
+        copy = Table(t.bbox, t.n_rows, t.n_cols,
+                     [Cell(c.row, c.col, c.text, c.rowspan, c.colspan) for c in t.cells],
+                     t.page, t.ruled, None, t.source)
+        tail[id(copy)] = t
+        merged.append(copy)
+    for t in merged:
+        t.cells.sort(key=lambda c: (c.row, c.col))
+    return merged
+
+
 _TR_NUMBER = re.compile(r"^-?(\d{1,3}(\.\d{3})+|\d+)(,\d+)?$")
 _EN_DECIMAL = re.compile(r"^-?\d+\.\d{1,2}$|^-?\d+\.\d{4,}$")
 
@@ -369,7 +444,7 @@ def export_xlsx(tables: list[Table], dst: str | Path, convert_numbers: bool = Tr
     per_page: dict[int, int] = {}
     for table in tables:
         per_page[table.page] = per_page.get(table.page, 0) + 1
-        ws = wb.create_sheet(f"Sayfa{table.page + 1}_Tablo{per_page[table.page]}")
+        ws = wb.create_sheet(f"Sayfa{table.page_label}_Tablo{per_page[table.page]}"[:31])
         widths = [8] * table.n_cols
         for cell in table.cells:
             xl = ws.cell(row=cell.row + 1, column=cell.col + 1)
