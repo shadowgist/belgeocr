@@ -9,13 +9,12 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import pytesseract
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, Side
 from openpyxl.utils import get_column_letter
 from PIL import Image
 
-from belgeocr import loader
+from belgeocr import loader, tesseract_setup
 from belgeocr.ocr import CancelFn, OcrOptions, ProgressFn, _check_cancel, preprocess
 
 
@@ -86,12 +85,7 @@ def _line_positions(profile: np.ndarray, threshold: float) -> list[int]:
 
 
 def _words(img: np.ndarray, lang: str, psm: int) -> list[_Word]:
-    data = pytesseract.image_to_data(
-        Image.fromarray(img),
-        lang=lang,
-        config=f"--psm {psm}",
-        output_type=pytesseract.Output.DICT,
-    )
+    data = tesseract_setup.image_to_data(Image.fromarray(img), lang, psm)
     words = []
     for i, text in enumerate(data["text"]):
         text = text.strip()

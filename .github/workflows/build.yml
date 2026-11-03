@@ -36,6 +36,15 @@ jobs:
         env:
           BELGEOCR_TESSERACT: ${{ github.workspace }}\packaging\tesseract\tesseract.exe
         run: pytest -q
+      - name: Tests with Turkish characters in paths
+        shell: pwsh
+        run: |
+          $dir = "C:\Kullanıcılar\Çağrı Şükrü"
+          New-Item -ItemType Directory -Force "$dir\Temp" | Out-Null
+          Copy-Item packaging\tesseract "$dir\tesseract" -Recurse
+          $env:TEMP = "$dir\Temp"; $env:TMP = "$dir\Temp"
+          $env:BELGEOCR_TESSERACT = "$dir\tesseract\tesseract.exe"
+          pytest -q -p no:cacheprovider
       - name: PyInstaller
         run: pyinstaller --noconfirm packaging/belgeocr.spec
       - name: Copy Tesseract into app

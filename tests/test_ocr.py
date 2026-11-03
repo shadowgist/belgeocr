@@ -83,3 +83,14 @@ def test_searchable_pdf_rotated_page(scanned_pdf, tmp_path, lang):
     rotated = pdf_tools.rotate(scanned_pdf, tmp_path / "rot.pdf", 90, "1")
     out = ocr.make_searchable_pdf(rotated, tmp_path / "rot_ocr.pdf", ocr.OcrOptions(lang=lang, dpi=150))
     assert "kütüphanede" in loader.pdf_page_text(out, 0) or lang != "tur"
+
+
+def test_turkish_characters_in_paths(text_png, tmp_path, lang):
+    folder = tmp_path / "Çağrı Şükrü İş Belgeleri"
+    folder.mkdir()
+    src = folder / "ışık_öğün.png"
+    src.write_bytes(text_png.read_bytes())
+    pages = ocr.ocr_file(src, ocr.OcrOptions(lang=lang))
+    assert "öğleden" in pages[0].text or lang != "tur"
+    out = ocr.make_searchable_pdf(src, folder / "çıktı.pdf", ocr.OcrOptions(lang=lang))
+    assert "öğleden" in loader.pdf_page_text(out, 0) or lang != "tur"

@@ -10,11 +10,10 @@ from typing import Callable
 
 import cv2
 import numpy as np
-import pytesseract
 from PIL import Image
 from pypdf import PdfReader, PdfWriter, Transformation
 
-from belgeocr import loader
+from belgeocr import loader, tesseract_setup
 
 ProgressFn = Callable[[int, int, str], None]
 CancelFn = Callable[[], bool]
@@ -121,20 +120,11 @@ def preprocess(img: Image.Image, deskew: bool = True) -> Image.Image:
     return out
 
 
-def _config(dpi: int, psm: int) -> str:
-    return f"--psm {psm} --dpi {dpi}"
-
-
 def ocr_image(img: Image.Image, options: OcrOptions | None = None) -> OcrPage:
     options = options or OcrOptions()
     prepared = preprocess(img, options.deskew)
     dpi = prepared.info["dpi"][0]
-    data = pytesseract.image_to_data(
-        prepared,
-        lang=options.lang,
-        config=_config(dpi, options.psm),
-        output_type=pytesseract.Output.DICT,
-    )
+    data = tesseract_setup.image_to_data(prepared, options.lang, options.psm, dpi)
     paragraphs: dict[tuple[int, int], OcrParagraph] = {}
     lines: dict[tuple[int, int, int], list[tuple[str, int]]] = {}
     confs: list[float] = []
@@ -185,20 +175,15 @@ def ocr_file(
 def _text_only_pdf(img: Image.Image, options: OcrOptions) -> bytes:
     """Return a one-page PDF containing only the invisible OCR text layer."""
     dpi = img.info.get("dpi", (options.dpi, options.dpi))[0]
-    return pytesseract.image_to_pdf_or_hocr(
-        img,
-        lang=options.lang,
-        extension="pdf",
-        config=_config(dpi, options.psm) + " -c textonly_pdf=1",
+    return tesseract_setup.run_image(
+        img, options.lang, options.psm, dpi, "pdf", ["-c", "textonly_pdf=1"]
     )
 
 
 def _image_pdf(img: Image.Image, options: OcrOptions) -> bytes:
     """Return a one-page PDF with the page image plus an invisible text layer."""
     dpi = img.info.get("dpi", (options.dpi, options.dpi))[0]
-    return pytesseract.image_to_pdf_or_hocr(
-        img, lang=options.lang, extension="pdf", config=_config(dpi, options.psm)
-    )
+    return tesseract_setup.run_image(img, options.lang, options.psm, dpi, "pdf")
 
 
 def make_searchable_pdf(
