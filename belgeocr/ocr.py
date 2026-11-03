@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,7 +10,6 @@ from typing import Callable
 import cv2
 import numpy as np
 from PIL import Image
-from pypdf import PdfReader, PdfWriter, Transformation
 
 from belgeocr import loader, tesseract_setup
 
@@ -180,31 +178,6 @@ def _text_only_pdf(img: Image.Image, options: OcrOptions) -> bytes:
     )
 
 
-def _image_page(img: Image.Image):
-    """Return a PDF page showing ``img`` at its DPI."""
-    dpi = img.info.get("dpi", (300, 300))[0]
-    buf = io.BytesIO()
-    img.save(buf, format="PDF", resolution=float(dpi), quality=90)
-    buf.seek(0)
-    return PdfReader(buf).pages[0]
-
-
-def _overlay_text(page, img: Image.Image, options: OcrOptions) -> None:
-    """Merge an invisible OCR text layer for ``img`` onto ``page``.
-
-    Tesseract only produces the text layer; it never has to write the page
-    image itself (its JPEG temp files break on non-ASCII %TEMP% on Windows).
-    """
-    text_page = PdfReader(io.BytesIO(_text_only_pdf(img, options))).pages[0]
-    page.transfer_rotation_to_content()
-    box = page.cropbox
-    sx = float(box.width) / float(text_page.mediabox.width)
-    sy = float(box.height) / float(text_page.mediabox.height)
-    page.merge_transformed_page(
-        text_page, Transformation().scale(sx, sy).translate(float(box.left), float(box.bottom))
-    )
-
-
 def make_searchable_pdf(
     src: str | Path,
     dst: str | Path,
@@ -218,34 +191,21 @@ def make_searchable_pdf(
     For PDF input the original pages are kept untouched and an invisible text
     layer is overlaid, so image quality and file size are preserved.
     """
-    options = options or OcrOptions()
-    src, dst = Path(src), Path(dst)
-    writer = PdfWriter()
-    total = loader.page_count(src)
+    from belgeocr.document import PageItem, build_pdf
 
-    if loader.is_pdf(src):
-        reader = PdfReader(str(src))
-        for index, page in enumerate(reader.pages):
-            _check_cancel(cancel)
-            if progress:
-                progress(index, total, f"Sayfa {index + 1}/{total} işleniyor...")
-            if skip_text_pages and loader.pdf_page_text(src, index).strip():
-                writer.add_page(page)
-                continue
-            img = loader.load_page(src, index, options.dpi)
-            _overlay_text(writer.add_page(page), img, options)
-    else:
-        for index in range(total):
-            _check_cancel(cancel)
-            if progress:
-                progress(index, total, f"Sayfa {index + 1}/{total} işleniyor...")
-            img = preprocess(loader.load_page(src, index, options.dpi), options.deskew)
-            _overlay_text(writer.add_page(_image_page(img)), img, options)
+    src = Path(src).resolve()
+    pages = [PageItem(src, i) for i in range(loader.page_count(src))]
+    return build_pdf(pages, dst, True, options, skip_text_pages, progress, cancel)
 
-    _check_cancel(cancel)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    with open(dst, "wb") as fh:
-        writer.write(fh)
-    if progress:
-        progress(total, total, "Tamamlandı")
-    return dst
+
+def page_from_text(page: OcrPage, text: str) -> OcrPage:
+    """Rebuild an OcrPage from user-edited text, keeping font size info."""
+    default_h = page.paragraphs[0].line_height if page.paragraphs else page.dpi * 0.11
+    heights = {p.text.strip(): p.line_height for p in page.paragraphs}
+    paragraphs = []
+    for block in text.split("\n\n"):
+        block = block.strip()
+        if block:
+            line_h = heights.get(block, default_h)
+            paragraphs.append(OcrParagraph([OcrLine(line, line_h) for line in block.split("\n")]))
+    return OcrPage(paragraphs, page.confidence, page.dpi, page.size)

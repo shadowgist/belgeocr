@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Iterator
 
@@ -11,6 +12,10 @@ from PIL import Image, ImageOps
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".gif"}
 PDF_EXTS = {".pdf"}
 SUPPORTED_EXTS = IMAGE_EXTS | PDF_EXTS
+
+# PDFium is not thread-safe: the UI thread renders previews while workers
+# render pages for OCR, so every PDFium call goes through this lock.
+PDFIUM_LOCK = threading.RLock()
 
 
 def is_pdf(path: str | Path) -> bool:
@@ -24,11 +29,12 @@ def is_supported(path: str | Path) -> bool:
 def page_count(path: str | Path) -> int:
     path = Path(path)
     if is_pdf(path):
-        doc = pdfium.PdfDocument(str(path))
-        try:
-            return len(doc)
-        finally:
-            doc.close()
+        with PDFIUM_LOCK:
+            doc = pdfium.PdfDocument(str(path))
+            try:
+                return len(doc)
+            finally:
+                doc.close()
     with Image.open(path) as img:
         return getattr(img, "n_frames", 1)
 
@@ -44,13 +50,14 @@ def load_page(path: str | Path, index: int, dpi: int = 300) -> Image.Image:
     """Return page ``index`` (0-based) rendered/loaded at ``dpi``."""
     path = Path(path)
     if is_pdf(path):
-        doc = pdfium.PdfDocument(str(path))
-        try:
-            page = doc[index]
-            img = page.render(scale=dpi / 72).to_pil()
-            page.close()
-        finally:
-            doc.close()
+        with PDFIUM_LOCK:
+            doc = pdfium.PdfDocument(str(path))
+            try:
+                page = doc[index]
+                img = page.render(scale=dpi / 72).to_pil()
+                page.close()
+            finally:
+                doc.close()
         img = _normalize(img)
         img.info["dpi"] = (dpi, dpi)
         return img
@@ -74,13 +81,14 @@ def iter_pages(
 
 def pdf_page_text(path: str | Path, index: int) -> str:
     """Return the embedded (digital) text of a PDF page, if any."""
-    doc = pdfium.PdfDocument(str(path))
-    try:
-        page = doc[index]
-        textpage = page.get_textpage()
-        text = textpage.get_text_range()
-        textpage.close()
-        page.close()
-        return text.replace("\r\n", "\n")
-    finally:
-        doc.close()
+    with PDFIUM_LOCK:
+        doc = pdfium.PdfDocument(str(path))
+        try:
+            page = doc[index]
+            textpage = page.get_textpage()
+            text = textpage.get_text_range()
+            textpage.close()
+            page.close()
+            return text.replace("\r\n", "\n")
+        finally:
+            doc.close()

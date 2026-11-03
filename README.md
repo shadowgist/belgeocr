@@ -8,7 +8,9 @@ ABBYY FineReader benzeri, Windows için masaüstü OCR ve PDF uygulaması.
 - **Aranabilir PDF:** Taranmış PDF'ye görünmez bir metin katmanı ekler. Orijinal görüntü kalitesi korunur, metin aranabilir ve kopyalanabilir.
 - **Word'e aktarma (DOCX):** Paragrafları, yaklaşık yazı boyutlarını ve başlıkları korur.
 - **Tabloları Excel'e aktarma (XLSX):** Çizgili tabloları (birleştirilmiş hücreler dahil) ve çizgisiz tabloları tanır. Türkçe sayı biçimlerini (`1.250,75`) sayıya çevirir.
-- **PDF araçları:** Birleştir (PDF ve resimler), böl, döndür, sayfa sil, sayfa çıkar.
+- **Sayfa düzenleme:** Soldaki sayfa panelinde tek tıkla sola/sağa 90° döndürme, seçili sayfaları silme, sürükleyerek sıralama, başka dosyalardan sayfa ekleme, seçili sayfaları ayrı PDF olarak kaydetme ve geri alma (Ctrl+Z).
+- **Tablo düzenleyici:** Tanınan tablolar Excel'e aktarılmadan önce düzenlenebilir (hücre, satır, sütun). Sayfalara bölünmüş tablolar (aynı sütun sayısı) tek tabloda birleştirilir, tekrarlanan başlık satırı atılır.
+- **Yapay zekâ ile analiz (F7):** Sayfa görüntüsü seçilen servise (Google Gemini, OpenAI veya Anthropic Claude) gönderilir, metin ve tablolar yüksek doğrulukla çıkarılır. API anahtarı Ayarlar > Yapay Zekâ bölümüne girilir. Belgeler seçilen servisin sunucularına gönderilir.
 
 ## Kurulum (son kullanıcı)
 
@@ -54,6 +56,8 @@ Copy-Item packaging\tesseract dist\BelgeOCR\tesseract -Recurse
 | `belgeocr/export_docx.py` | Word ve TXT çıktısı |
 | `belgeocr/tables.py` | Tablo algılama (OpenCV), hücre OCR, Excel çıktısı |
 | `belgeocr/pdf_tools.py` | Birleştirme, bölme, döndürme, sayfa işlemleri (pypdf) |
+| `belgeocr/document.py` | Düzenlenebilir sayfa listesi (döndür/sil/sırala/geri al) ve PDF yazma |
+| `belgeocr/ai.py` | Yapay zekâ sağlayıcıları (Gemini, OpenAI, Claude) ile sayfa analizi |
 | `belgeocr/gui/` | PySide6 arayüzü |
 
-Tüm bağımlılıklar ticari kullanıma izin veren lisanslara sahiptir: Tesseract (Apache 2.0), PySide6 (LGPL), pypdf (BSD), pypdfium2 (Apache/BSD), OpenCV (Apache 2.0), python-docx ve openpyxl (MIT).
+Tüm bağımlılıklar ticari kullanıma izin veren lisanslara sahiptir: Tesseract (Apache 2.0), PySide6 (LGPL), pypdf (BSD), pypdfium2 (Apache/BSD), OpenCV (Apache 2.0), python-docx, openpyxl ve QtAwesome (MIT).

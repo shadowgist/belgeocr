@@ -2,20 +2,19 @@
 
 from __future__ import annotations
 
-import os
 import sys
-from functools import partial
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QSettings, Qt, QThreadPool, QUrl
-from PySide6.QtGui import QAction, QDesktopServices, QImage, QKeySequence, QPixmap
+import qtawesome as qta
+from PySide6.QtCore import QItemSelectionModel, QSettings, QSize, Qt, QThreadPool, QTimer, QUrl
+from PySide6.QtGui import QAction, QDesktopServices, QIcon, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
-    QCheckBox,
-    QComboBox,
+    QAbstractItemView,
+    QApplication,
     QFileDialog,
-    QHBoxLayout,
     QLabel,
+    QListView,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -25,20 +24,25 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSplitter,
-    QStyle,
+    QTabWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
-from belgeocr import APP_NAME, __version__, export_docx, loader, ocr, tables, tesseract_setup
-from belgeocr.gui.pdf_tools_dialog import PdfToolsDialog
+from belgeocr import APP_NAME, __version__, ai, export_docx, loader, ocr, tables, tesseract_setup
+from belgeocr.document import Document, PageItem, build_pdf
+from belgeocr.gui import settings_dialog as sd
+from belgeocr.gui.table_editor import TableEditor
+from belgeocr.gui.theme import apply_theme, icon_color
 from belgeocr.gui.workers import Worker
 
 FILE_FILTER = (
     "Belgeler (*.pdf *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.gif);;"
     "PDF (*.pdf);;Resimler (*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.gif)"
 )
+THUMB_DPI = 24
+VIEW_DPI = 110
 
 
 def resource_path(name: str) -> Path:
@@ -53,341 +57,374 @@ def pil_to_pixmap(img) -> QPixmap:
     return QPixmap.fromImage(qimg.copy())
 
 
-def page_from_text(page: ocr.OcrPage, text: str) -> ocr.OcrPage:
-    """Rebuild an OcrPage from user-edited text, keeping font size info."""
-    height = page.paragraphs[0].line_height if page.paragraphs else page.dpi / 6
-    heights = {p.text.strip(): p.line_height for p in page.paragraphs}
-    paragraphs = []
-    for block in text.split("\n\n"):
-        block = block.strip()
-        if block:
-            line_h = heights.get(block, height)
-            paragraphs.append(
-                ocr.OcrParagraph([ocr.OcrLine(line, line_h) for line in block.split("\n")])
-            )
-    return ocr.OcrPage(paragraphs, page.confidence, page.dpi, page.size)
+class ThumbList(QListWidget):
+    def __init__(self, on_reorder: Callable[[], None]):
+        super().__init__()
+        self.setObjectName("thumbs")
+        self.setViewMode(QListView.ViewMode.IconMode)
+        self.setFlow(QListView.Flow.TopToBottom)
+        self.setWrapping(False)
+        self.setResizeMode(QListView.ResizeMode.Adjust)
+        self.setMovement(QListView.Movement.Snap)
+        self.setIconSize(QSize(130, 170))
+        self.setSpacing(4)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setUniformItemSizes(True)
+        self.setMinimumWidth(170)
+        self._on_reorder = on_reorder
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        if event.source() is self:
+            super().dropEvent(event)
+            QTimer.singleShot(0, self._on_reorder)
+        else:
+            event.ignore()
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, ocr_available: bool = True):
+    def __init__(self, ocr_available: bool = True, settings: QSettings | None = None):
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} {__version__}")
-        self.resize(1400, 860)
+        self.resize(1440, 900)
         self.setAcceptDrops(True)
-        self.settings = QSettings(APP_NAME, APP_NAME)
+        self.settings = settings or QSettings(APP_NAME, APP_NAME)
         self.ocr_available = ocr_available
         self.pool = QThreadPool.globalInstance()
         self.worker: Worker | None = None
-        self.results: dict[str, list[ocr.OcrPage]] = {}
-        self.edits: dict[tuple[str, int], str] = {}
-        self.current_page = 0
+        self.doc = Document()
+        self.doc_path: Path | None = None
+        self.zoom = 1.0
+        self.fit_width = True
         self._loading_text = False
-        self._preview_cache: tuple[str, int, QPixmap] | None = None
+        self._thumb_cache: dict[tuple[int, int], QIcon] = {}
+        self._view_cache: tuple[tuple, QPixmap] | None = None
+        self._icon_actions: list[tuple[QAction, str]] = []
+        self.languages = self._languages()
 
+        self._build_actions()
+        self._build_menus()
         self._build_toolbar()
         self._build_central()
         self._build_statusbar()
-        self._update_actions()
+        self.apply_theme()
+        self._refresh_all()
 
-    # ----------------------------------------------------------------- UI
-    def _build_toolbar(self) -> None:
-        tb = QToolBar("Ana araç çubuğu")
-        tb.setMovable(False)
-        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-        self.addToolBar(tb)
-        style = self.style()
+    # ------------------------------------------------------------ helpers
+    def icon(self, name: str) -> QIcon:
+        return qta.icon(f"mdi6.{name}", color=icon_color(sd.value(self.settings, "theme")),
+                        color_disabled="#8a8f99")
 
-        def action(text, icon, slot, shortcut=None, tip=None):
-            act = QAction(style.standardIcon(icon), text, self)
-            act.triggered.connect(slot)
-            if shortcut:
-                act.setShortcut(QKeySequence(shortcut))
-            act.setToolTip(tip or text)
-            tb.addAction(act)
-            return act
-
-        SP = QStyle.StandardPixmap
-        self.act_open = action("Dosya Ekle", SP.SP_DialogOpenButton, self.open_files, "Ctrl+O")
-        tb.addSeparator()
-        self.act_ocr = action("Metni Tanı (OCR)", SP.SP_MediaPlay, self.run_ocr, "F5",
-                              "Seçili belgedeki metni tanı")
-        self.act_pdf = action("Aranabilir PDF", SP.SP_FileDialogDetailedView, self.make_searchable,
-                              tip="Taranmış belgeyi aranabilir/kopyalanabilir PDF'ye çevir")
-        self.act_docx = action("Word'e Aktar", SP.SP_FileIcon, self.export_word, "Ctrl+W")
-        self.act_xlsx = action("Tabloları Excel'e", SP.SP_FileDialogListView, self.export_excel,
-                               tip="Tabloları tanı ve Excel dosyasına aktar")
-        self.act_txt = action("Metni Kaydet", SP.SP_DialogSaveButton, self.export_text, "Ctrl+S")
-        tb.addSeparator()
-        self.act_tools = action("PDF Araçları", SP.SP_DirIcon, self.open_pdf_tools,
-                                tip="Birleştir, böl, döndür, sayfa sil/çıkar")
-        tb.addSeparator()
-        self.act_about = action("Hakkında", SP.SP_MessageBoxInformation, self.about)
-
-    def _build_central(self) -> None:
-        root = QWidget()
-        layout = QVBoxLayout(root)
-
-        opts = QHBoxLayout()
-        opts.addWidget(QLabel("Dil:"))
-        self.lang_combo = QComboBox()
-        self._fill_languages()
-        opts.addWidget(self.lang_combo)
-        opts.addSpacing(12)
-        opts.addWidget(QLabel("Çözünürlük:"))
-        self.dpi_combo = QComboBox()
-        for dpi in (200, 300, 400):
-            self.dpi_combo.addItem(f"{dpi} DPI", dpi)
-        self.dpi_combo.setCurrentIndex(1)
-        opts.addWidget(self.dpi_combo)
-        opts.addSpacing(12)
-        self.deskew_box = QCheckBox("Eğikliği düzelt")
-        self.deskew_box.setChecked(True)
-        opts.addWidget(self.deskew_box)
-        self.borderless_box = QCheckBox("Çizgisiz tabloları da ara")
-        self.borderless_box.setChecked(True)
-        opts.addWidget(self.borderless_box)
-        self.skiptext_box = QCheckBox("Metin içeren PDF sayfalarını atla")
-        self.skiptext_box.setChecked(True)
-        self.skiptext_box.setToolTip("Aranabilir PDF oluştururken zaten metni olan sayfalara dokunma")
-        opts.addWidget(self.skiptext_box)
-        opts.addStretch()
-        layout.addLayout(opts)
-
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-
-        left = QWidget()
-        left_l = QVBoxLayout(left)
-        left_l.setContentsMargins(0, 0, 0, 0)
-        left_l.addWidget(QLabel("Belgeler (sürükleyip bırakabilirsiniz)"))
-        self.file_list = QListWidget()
-        self.file_list.currentItemChanged.connect(self._on_file_changed)
-        left_l.addWidget(self.file_list)
-        btns = QHBoxLayout()
-        add_btn = QPushButton("Ekle")
-        add_btn.clicked.connect(self.open_files)
-        rm_btn = QPushButton("Kaldır")
-        rm_btn.clicked.connect(self.remove_selected)
-        btns.addWidget(add_btn)
-        btns.addWidget(rm_btn)
-        left_l.addLayout(btns)
-        splitter.addWidget(left)
-
-        middle = QWidget()
-        mid_l = QVBoxLayout(middle)
-        mid_l.setContentsMargins(0, 0, 0, 0)
-        nav = QHBoxLayout()
-        self.prev_btn = QPushButton("◀")
-        self.prev_btn.clicked.connect(partial(self._step_page, -1))
-        self.next_btn = QPushButton("▶")
-        self.next_btn.clicked.connect(partial(self._step_page, 1))
-        self.page_label = QLabel("Belge yok")
-        self.page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        nav.addWidget(self.prev_btn)
-        nav.addWidget(self.page_label, 1)
-        nav.addWidget(self.next_btn)
-        mid_l.addLayout(nav)
-        self.preview = QLabel("Başlamak için bir PDF veya resim ekleyin")
-        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setStyleSheet("background:#5a5a5a; color:#eee;")
-        self.preview_scroll = QScrollArea()
-        self.preview_scroll.setWidgetResizable(True)
-        self.preview_scroll.setWidget(self.preview)
-        mid_l.addWidget(self.preview_scroll)
-        splitter.addWidget(middle)
-
-        right = QWidget()
-        right_l = QVBoxLayout(right)
-        right_l.setContentsMargins(0, 0, 0, 0)
-        self.text_label = QLabel("Tanınan metin")
-        right_l.addWidget(self.text_label)
-        self.text_edit = QPlainTextEdit()
-        self.text_edit.setPlaceholderText("OCR sonucu burada görünecek. Metni düzenleyebilirsiniz.")
-        self.text_edit.textChanged.connect(self._on_text_edited)
-        right_l.addWidget(self.text_edit)
-        copy_btn = QPushButton("Tümünü Kopyala")
-        copy_btn.clicked.connect(self._copy_text)
-        right_l.addWidget(copy_btn)
-        splitter.addWidget(right)
-
-        splitter.setSizes([260, 620, 520])
-        layout.addWidget(splitter, 1)
-        self.setCentralWidget(root)
-
-    def _build_statusbar(self) -> None:
-        sb = self.statusBar()
-        self.progress = QProgressBar()
-        self.progress.setMaximumWidth(320)
-        self.progress.setVisible(False)
-        self.cancel_btn = QPushButton("İptal")
-        self.cancel_btn.setVisible(False)
-        self.cancel_btn.clicked.connect(self._cancel_worker)
-        sb.addPermanentWidget(self.progress)
-        sb.addPermanentWidget(self.cancel_btn)
-        sb.showMessage("Hazır" if self.ocr_available else "Tesseract bulunamadı: OCR devre dışı")
-
-    def _fill_languages(self) -> None:
-        langs = []
-        if self.ocr_available:
-            try:
-                langs = tesseract_setup.available_languages()
-            except Exception:  # noqa: BLE001
-                langs = []
-        options = []
-        if "tur" in langs and "eng" in langs:
-            options.append("tur+eng")
-        options += [lang for lang in ("tur", "eng") if lang in langs]
-        options += [lang for lang in langs if lang not in ("tur", "eng")]
-        for code in options or ["eng"]:
-            self.lang_combo.addItem(tesseract_setup.language_label(code), code)
-        saved = self.settings.value("lang")
-        if saved and (i := self.lang_combo.findData(saved)) >= 0:
-            self.lang_combo.setCurrentIndex(i)
-        self.lang_combo.currentIndexChanged.connect(
-            lambda: self.settings.setValue("lang", self.lang_combo.currentData())
-        )
-
-    # -------------------------------------------------------------- state
-    def options(self) -> ocr.OcrOptions:
-        return ocr.OcrOptions(
-            lang=self.lang_combo.currentData(),
-            dpi=self.dpi_combo.currentData(),
-            deskew=self.deskew_box.isChecked(),
-        )
-
-    def current_file(self) -> str | None:
-        item = self.file_list.currentItem()
-        return item.data(Qt.ItemDataRole.UserRole) if item else None
-
-    def page_total(self) -> int:
-        path = self.current_file()
-        if not path:
-            return 0
+    def _languages(self) -> list[str]:
+        if not self.ocr_available:
+            return []
         try:
-            return loader.page_count(path)
+            return tesseract_setup.available_languages()
         except Exception:  # noqa: BLE001
-            return 0
+            return []
+
+    def options(self) -> ocr.OcrOptions:
+        opts = sd.ocr_options(self.settings)
+        if self.languages and not all(p in self.languages for p in opts.lang.split("+")):
+            opts.lang = "tur+eng" if {"tur", "eng"} <= set(self.languages) else self.languages[0]
+        return opts
+
+    def selected_pages(self) -> list[PageItem]:
+        rows = sorted(self.thumbs.row(i) for i in self.thumbs.selectedItems())
+        return [self.doc.pages[r] for r in rows if r < len(self.doc.pages)]
+
+    def current_page(self) -> PageItem | None:
+        row = self.thumbs.currentRow()
+        return self.doc.pages[row] if 0 <= row < len(self.doc.pages) else None
 
     def _busy(self) -> bool:
         return self.worker is not None
 
+    # ---------------------------------------------------------------- UI
+    def _act(self, text: str, icon: str | None, slot, shortcut=None, tip: str | None = None) -> QAction:
+        act = QAction(text, self)
+        act.triggered.connect(lambda checked=False: slot())
+        if shortcut:
+            act.setShortcuts([QKeySequence(s) for s in (shortcut if isinstance(shortcut, list) else [shortcut])])
+        act.setToolTip(f"{tip or text}" + (f" ({act.shortcut().toString()})" if shortcut else ""))
+        act.setStatusTip(tip or text)
+        if icon:
+            self._icon_actions.append((act, icon))
+        return act
+
+    def _build_actions(self) -> None:
+        self.a_open = self._act("Aç", "folder-open-outline", self.open_files, "Ctrl+O", "Belge aç")
+        self.a_add = self._act("Sayfa Ekle", "file-plus-outline", self.add_pages_dialog, "Ctrl+Shift+O",
+                               "Başka bir PDF veya resmin sayfalarını sona ekle")
+        self.a_save = self._act("Kaydet", "content-save-outline", self.save, "Ctrl+S",
+                                "Belgeyi PDF olarak kaydet (döndürme/silme dahil)")
+        self.a_save_as = self._act("Farklı Kaydet...", None, self.save_as, "Ctrl+Shift+S")
+        self.a_extract = self._act("Seçili Sayfaları PDF Olarak Kaydet...", "file-export-outline",
+                                   self.export_selected, None)
+        self.a_searchable = self._act("Aranabilir PDF", "file-pdf-box", self.export_searchable, None,
+                                      "Taranmış belgeyi aranabilir/kopyalanabilir PDF olarak kaydet")
+        self.a_word = self._act("Word", "microsoft-word", self.export_word, "Ctrl+Shift+W",
+                                "Metni Word belgesi olarak dışa aktar")
+        self.a_excel = self._act("Excel", "microsoft-excel", self.export_excel, "Ctrl+Shift+E",
+                                 "Tabloları Excel'e aktar")
+        self.a_txt = self._act("Metin (TXT)...", None, self.export_text, None)
+        self.a_quit = self._act("Çıkış", None, self.close, "Ctrl+Q")
+
+        self.a_undo = self._act("Geri Al", "undo", self.undo, "Ctrl+Z")
+        self.a_rot_l = self._act("Sola Döndür", "rotate-left", lambda: self.rotate(-90), "Ctrl+L",
+                                 "Seçili sayfaları 90° sola döndür")
+        self.a_rot_r = self._act("Sağa Döndür", "rotate-right", lambda: self.rotate(90), "Ctrl+R",
+                                 "Seçili sayfaları 90° sağa döndür")
+        self.a_delete = self._act("Sayfayı Sil", "delete-outline", self.delete_pages, "Delete",
+                                  "Seçili sayfaları sil")
+        self.a_select_all = self._act("Tüm Sayfaları Seç", "select-all", self.thumbs_select_all, None)
+
+        self.a_ocr = self._act("Metni Tanı", "text-recognition", self.run_ocr, "F5",
+                               "Tüm sayfalardaki metni tanı (OCR)")
+        self.a_tables = self._act("Tabloları Tanı", "table-search", self.run_tables, "F6",
+                                  "Tüm sayfalardaki tabloları tanı")
+        self.a_ai = self._act("Yapay Zekâ", "creation", self.run_ai, "F7",
+                              "Yapay zekâ ile tüm sayfaları incele: metin ve tabloları en yüksek doğrulukla çıkar")
+        self.a_ai_sel = self._act("Seçili Sayfaları Yapay Zekâ ile İncele", None,
+                                  lambda: self.run_ai(selected_only=True), "Shift+F7")
+
+        self.a_zoom_in = self._act("Yakınlaştır", "magnify-plus-outline", lambda: self.set_zoom(1.25), "Ctrl++")
+        self.a_zoom_out = self._act("Uzaklaştır", "magnify-minus-outline", lambda: self.set_zoom(0.8), "Ctrl+-")
+        self.a_fit = self._act("Genişliğe Sığdır", "fit-to-page-outline", self.set_fit, "Ctrl+0")
+        self.a_theme = self._act("Açık/Koyu Tema", "theme-light-dark", self.toggle_theme, None)
+        self.a_settings = self._act("Ayarlar", "cog-outline", self.open_settings, "Ctrl+,")
+        self.a_about = self._act("Hakkında", "information-outline", self.about, None)
+
+    def _build_menus(self) -> None:
+        mb = self.menuBar()
+        m = mb.addMenu("&Dosya")
+        m.addActions([self.a_open, self.a_add])
+        m.addSeparator()
+        m.addActions([self.a_save, self.a_save_as, self.a_extract])
+        exp = m.addMenu("Dışa Aktar")
+        exp.addActions([self.a_word, self.a_excel, self.a_searchable, self.a_txt])
+        m.addSeparator()
+        m.addAction(self.a_quit)
+        m = mb.addMenu("Dü&zen")
+        m.addActions([self.a_undo])
+        m.addSeparator()
+        m.addActions([self.a_rot_l, self.a_rot_r, self.a_delete, self.a_select_all])
+        m = mb.addMenu("&Tanıma")
+        m.addActions([self.a_ocr, self.a_tables])
+        m.addSeparator()
+        m.addActions([self.a_ai, self.a_ai_sel])
+        m = mb.addMenu("&Görünüm")
+        m.addActions([self.a_zoom_in, self.a_zoom_out, self.a_fit])
+        m.addSeparator()
+        m.addAction(self.a_theme)
+        m = mb.addMenu("&Araçlar")
+        m.addAction(self.a_settings)
+        m = mb.addMenu("&Yardım")
+        m.addAction(self.a_about)
+
+    def _build_toolbar(self) -> None:
+        tb = QToolBar("Ana araç çubuğu")
+        tb.setObjectName("main_toolbar")
+        tb.setMovable(False)
+        tb.setIconSize(QSize(26, 26))
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+        self.addToolBar(tb)
+        for group in (
+            [self.a_open, self.a_add, self.a_save],
+            [self.a_undo, self.a_rot_l, self.a_rot_r, self.a_delete],
+            [self.a_ocr, self.a_tables, self.a_ai],
+            [self.a_word, self.a_excel, self.a_searchable],
+            [self.a_zoom_out, self.a_zoom_in, self.a_fit],
+            [self.a_settings],
+        ):
+            tb.addActions(group)
+            tb.addSeparator()
+        self.toolbar = tb
+
+    def _build_central(self) -> None:
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.thumbs = ThumbList(self._on_reorder)
+        self.thumbs.currentRowChanged.connect(lambda _: self._show_current())
+        self.thumbs.itemSelectionChanged.connect(self._update_actions)
+        splitter.addWidget(self.thumbs)
+
+        self.viewer = QLabel()
+        self.viewer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.viewer_scroll = QScrollArea()
+        self.viewer_scroll.setWidgetResizable(True)
+        self.viewer_scroll.setWidget(self.viewer)
+        self.viewer_scroll.setStyleSheet("QScrollArea { background: #6b7280; } QLabel { background: #6b7280; color: #f3f4f6; }")
+        splitter.addWidget(self.viewer_scroll)
+
+        self.side_tabs = QTabWidget()
+        text_tab = QWidget()
+        tl = QVBoxLayout(text_tab)
+        tl.setContentsMargins(4, 4, 4, 4)
+        self.text_info = QLabel()
+        tl.addWidget(self.text_info)
+        self.text_edit = QPlainTextEdit()
+        self.text_edit.setPlaceholderText("Tanınan metin burada görünür ve düzenlenebilir.")
+        self.text_edit.textChanged.connect(self._on_text_edited)
+        tl.addWidget(self.text_edit, 1)
+        copy_btn = QPushButton("Sayfa Metnini Kopyala")
+        copy_btn.clicked.connect(lambda: (QApplication.clipboard().setText(self.text_edit.toPlainText()),
+                                          self.statusBar().showMessage("Metin panoya kopyalandı", 3000)))
+        tl.addWidget(copy_btn)
+        self.side_tabs.addTab(text_tab, "Metin")
+        self.table_editor = TableEditor(self.icon)
+        self.side_tabs.addTab(self.table_editor, "Tablolar")
+        splitter.addWidget(self.side_tabs)
+
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([190, 760, 490])
+        self.setCentralWidget(splitter)
+
+    def _build_statusbar(self) -> None:
+        sb = self.statusBar()
+        self.page_status = QLabel()
+        self.progress = QProgressBar()
+        self.progress.setMaximumWidth(280)
+        self.progress.setVisible(False)
+        self.cancel_btn = QPushButton("İptal")
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.clicked.connect(self._cancel_worker)
+        sb.addPermanentWidget(self.page_status)
+        sb.addPermanentWidget(self.progress)
+        sb.addPermanentWidget(self.cancel_btn)
+        sb.showMessage("Hazır" if self.ocr_available else "Tesseract bulunamadı: OCR devre dışı")
+
+    def apply_theme(self) -> None:
+        apply_theme(QApplication.instance(), sd.value(self.settings, "theme"))
+        for act, name in self._icon_actions:
+            act.setIcon(self.icon(name))
+        self.table_editor.refresh_icons()
+
+    def toggle_theme(self) -> None:
+        mode = "dark" if sd.value(self.settings, "theme") == "light" else "light"
+        self.settings.setValue("theme", mode)
+        self.apply_theme()
+
+    # ------------------------------------------------------------ refresh
+    def _refresh_all(self) -> None:
+        self._rebuild_thumbs()
+        self._show_current()
+        self._update_title()
+        self._update_actions()
+
+    def _update_title(self) -> None:
+        name = self.doc_path.name if self.doc_path else (
+            self.doc.sources[0].name if self.doc.sources else "Yeni belge")
+        mark = " •" if self.doc.modified and self.doc.pages else ""
+        self.setWindowTitle(f"{name}{mark} — {APP_NAME} {__version__}")
+
     def _update_actions(self) -> None:
-        has_file = self.current_file() is not None
         idle = not self._busy()
-        for act in (self.act_ocr, self.act_pdf, self.act_docx, self.act_xlsx):
-            act.setEnabled(has_file and idle and self.ocr_available)
-        self.act_txt.setEnabled(has_file and idle)
-        self.act_open.setEnabled(idle)
-        self.act_tools.setEnabled(idle)
+        has = bool(self.doc.pages)
+        sel = bool(self.selected_pages())
+        ocr_ok = self.ocr_available and has and idle
+        for a in (self.a_open, self.a_add, self.a_settings, self.a_theme):
+            a.setEnabled(idle)
+        for a in (self.a_save, self.a_save_as, self.a_txt, self.a_select_all):
+            a.setEnabled(has and idle)
+        for a in (self.a_rot_l, self.a_rot_r, self.a_delete, self.a_extract):
+            a.setEnabled(sel and idle)
+        self.a_undo.setEnabled(self.doc.can_undo and idle)
+        for a in (self.a_ocr, self.a_tables, self.a_word, self.a_excel, self.a_searchable):
+            a.setEnabled(ocr_ok)
+        self.a_ai.setEnabled(has and idle)
+        self.a_ai_sel.setEnabled(sel and idle)
+        self.thumbs.setDragEnabled(idle)
+        n = len(self.doc.pages)
+        cur = self.thumbs.currentRow()
+        self.page_status.setText(f"Sayfa {cur + 1} / {n}" if n and cur >= 0 else "")
 
-    # -------------------------------------------------------------- files
-    def open_files(self) -> None:
-        start = self.settings.value("last_dir", str(Path.home()))
-        paths, _ = QFileDialog.getOpenFileNames(self, "Belge seç", start, FILE_FILTER)
-        if paths:
-            self.settings.setValue("last_dir", str(Path(paths[0]).parent))
-            self.add_files(paths)
+    def _thumb_icon(self, item: PageItem) -> QIcon:
+        key = (id(item), item.rotation)
+        if key not in self._thumb_cache:
+            try:
+                img = item.image(THUMB_DPI)
+                img.thumbnail((130, 170))
+                icon = QIcon()
+                pix = pil_to_pixmap(img)
+                icon.addPixmap(pix, QIcon.Mode.Normal)
+                icon.addPixmap(pix, QIcon.Mode.Selected)
+                self._thumb_cache[key] = icon
+            except Exception:  # noqa: BLE001
+                self._thumb_cache[key] = self.icon("file-alert-outline")
+        return self._thumb_cache[key]
 
-    def add_files(self, paths: list[str]) -> None:
-        existing = {self.file_list.item(i).data(Qt.ItemDataRole.UserRole)
-                    for i in range(self.file_list.count())}
-        added = None
-        for path in paths:
-            path = str(Path(path).resolve())
-            if not loader.is_supported(path) or path in existing or not os.path.isfile(path):
-                continue
-            existing.add(path)
-            item = QListWidgetItem(Path(path).name)
-            item.setToolTip(path)
-            item.setData(Qt.ItemDataRole.UserRole, path)
-            self.file_list.addItem(item)
-            added = item
-        if added:
-            self.file_list.setCurrentItem(added)
+    @staticmethod
+    def _thumb_label(pos: int, item: PageItem) -> str:
+        marks = ""
+        if item.ai_text or item.ai_tables:
+            marks += " ✦"
+        elif item.ocr or item.tables is not None:
+            marks += " ✓"
+        return f"{pos + 1}{marks}"
 
-    def remove_selected(self) -> None:
-        row = self.file_list.currentRow()
-        if row >= 0:
-            item = self.file_list.takeItem(row)
-            path = item.data(Qt.ItemDataRole.UserRole)
-            self.results.pop(path, None)
-            self.edits = {k: v for k, v in self.edits.items() if k[0] != path}
-        if self.file_list.count() == 0:
-            self._show_empty()
+    def _rebuild_thumbs(self, select: list[PageItem] | None = None, current: PageItem | None = None) -> None:
+        current = current or self.current_page()
+        selected = {id(p) for p in (select if select is not None else self.selected_pages())}
+        self.thumbs.blockSignals(True)
+        self.thumbs.clear()
+        cur_row = -1
+        for pos, item in enumerate(self.doc.pages):
+            w = QListWidgetItem(self._thumb_icon(item), self._thumb_label(pos, item))
+            w.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+            w.setToolTip(item.label)
+            w.setData(Qt.ItemDataRole.UserRole, id(item))
+            self.thumbs.addItem(w)
+            if id(item) in selected:
+                w.setSelected(True)
+            if item is current:
+                cur_row = pos
+        if self.doc.pages:
+            row = cur_row if cur_row >= 0 else 0
+            self.thumbs.setCurrentRow(row, QItemSelectionModel.SelectionFlag.NoUpdate)
+            if not selected:
+                self.thumbs.item(row).setSelected(True)
+        self.thumbs.blockSignals(False)
 
-    def dragEnterEvent(self, event) -> None:  # noqa: N802
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+    def _refresh_labels(self) -> None:
+        for pos, item in enumerate(self.doc.pages):
+            if pos < self.thumbs.count():
+                self.thumbs.item(pos).setText(self._thumb_label(pos, item))
 
-    def dropEvent(self, event) -> None:  # noqa: N802
-        self.add_files([u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()])
-
-    def keyPressEvent(self, event) -> None:  # noqa: N802
-        if event.key() == Qt.Key.Key_Delete and self.file_list.hasFocus():
-            self.remove_selected()
-        elif event.key() == Qt.Key.Key_PageDown:
-            self._step_page(1)
-        elif event.key() == Qt.Key.Key_PageUp:
-            self._step_page(-1)
-        else:
-            super().keyPressEvent(event)
-
-    # ------------------------------------------------------------ preview
-    def _show_empty(self) -> None:
-        self.preview.setPixmap(QPixmap())
-        self.preview.setText("Başlamak için bir PDF veya resim ekleyin")
-        self.page_label.setText("Belge yok")
-        self._set_text("")
+    def _show_current(self) -> None:
+        item = self.current_page()
         self._update_actions()
-
-    def _on_file_changed(self, *_):
-        self.current_page = 0
-        self._preview_cache = None
-        self._refresh_page()
-        self._update_actions()
-
-    def _step_page(self, delta: int) -> None:
-        total = self.page_total()
-        if total:
-            self.current_page = max(0, min(total - 1, self.current_page + delta))
-            self._refresh_page()
-
-    def _refresh_page(self) -> None:
-        path = self.current_file()
-        if not path:
-            self._show_empty()
+        if item is None:
+            self.viewer.setPixmap(QPixmap())
+            self.viewer.setText("Başlamak için bir PDF veya resim açın ya da buraya sürükleyin")
+            self._set_text("")
+            self.text_info.setText("")
             return
-        total = self.page_total()
-        self.page_label.setText(f"{Path(path).name} — Sayfa {self.current_page + 1} / {total}")
-        self.prev_btn.setEnabled(self.current_page > 0)
-        self.next_btn.setEnabled(self.current_page < total - 1)
-        try:
-            img = loader.load_page(path, self.current_page, dpi=110)
-            pix = pil_to_pixmap(img)
-            width = max(200, self.preview_scroll.viewport().width() - 20)
-            if pix.width() > width:
-                pix = pix.scaledToWidth(width, Qt.TransformationMode.SmoothTransformation)
-            self.preview.setPixmap(pix)
-        except Exception as exc:  # noqa: BLE001
-            self.preview.setPixmap(QPixmap())
-            self.preview.setText(f"Önizleme açılamadı:\n{exc}")
-        self._show_page_text()
+        self._render_view(item)
+        self._set_text(item.text)
+        if item.ai_text:
+            self.text_info.setText("Kaynak: Yapay zekâ")
+        elif item.ocr:
+            self.text_info.setText(f"Kaynak: OCR — güven %{item.ocr.confidence:.0f}")
+        else:
+            self.text_info.setText("Bu sayfa henüz tanınmadı (F5: Metni Tanı, F7: Yapay Zekâ)")
 
-    def _show_page_text(self) -> None:
-        path = self.current_file()
-        pages = self.results.get(path or "")
-        key = (path, self.current_page)
-        if key in self.edits:
-            text = self.edits[key]
-        elif pages and self.current_page < len(pages):
-            text = pages[self.current_page].text
+    def _render_view(self, item: PageItem) -> None:
+        width = max(200, self.viewer_scroll.viewport().width() - 24)
+        key = (id(item), item.rotation, round(self.zoom, 3), self.fit_width, width if self.fit_width else 0)
+        if self._view_cache and self._view_cache[0] == key:
+            pix = self._view_cache[1]
         else:
-            text = ""
-        if pages and self.current_page < len(pages):
-            conf = pages[self.current_page].confidence
-            self.text_label.setText(f"Tanınan metin — güven: %{conf:.0f}")
-        else:
-            self.text_label.setText("Tanınan metin")
-        self._set_text(text)
+            try:
+                dpi = int(VIEW_DPI * (1 if self.fit_width else self.zoom))
+                pix = pil_to_pixmap(item.image(max(40, min(dpi, 400))))
+                if self.fit_width and pix.width() != width:
+                    pix = pix.scaledToWidth(width, Qt.TransformationMode.SmoothTransformation)
+            except Exception as exc:  # noqa: BLE001
+                self.viewer.setPixmap(QPixmap())
+                self.viewer.setText(f"Sayfa görüntülenemedi:\n{exc}")
+                return
+            self._view_cache = (key, pix)
+        self.viewer.setPixmap(pix)
 
     def _set_text(self, text: str) -> None:
         self._loading_text = True
@@ -395,21 +432,222 @@ class MainWindow(QMainWindow):
         self._loading_text = False
 
     def _on_text_edited(self) -> None:
-        path = self.current_file()
-        if self._loading_text or not path or path not in self.results:
-            return
-        self.edits[(path, self.current_page)] = self.text_edit.toPlainText()
-
-    def _copy_text(self) -> None:
-        from PySide6.QtWidgets import QApplication
-
-        QApplication.clipboard().setText(self.text_edit.toPlainText())
-        self.statusBar().showMessage("Metin panoya kopyalandı", 3000)
+        item = self.current_page()
+        if not self._loading_text and item is not None:
+            item.edited_text = self.text_edit.toPlainText()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
-        if self.current_file():
-            self._refresh_page()
+        if self.fit_width and self.current_page():
+            QTimer.singleShot(0, lambda: self.current_page() and self._render_view(self.current_page()))
+
+    def set_zoom(self, factor: float) -> None:
+        if self.fit_width:
+            self.zoom = max(0.2, (self.viewer_scroll.viewport().width() - 24) / (8.27 * VIEW_DPI))
+        self.fit_width = False
+        self.zoom = max(0.25, min(4.0, self.zoom * factor))
+        self._show_current()
+
+    def set_fit(self) -> None:
+        self.fit_width = True
+        self.zoom = 1.0
+        self._show_current()
+
+    # -------------------------------------------------------------- files
+    def _confirm_discard(self) -> bool:
+        if not (self.doc.modified and self.doc.pages):
+            return True
+        res = QMessageBox.question(
+            self, APP_NAME, "Belgede kaydedilmemiş değişiklikler var. Devam edilsin mi?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        return res == QMessageBox.StandardButton.Yes
+
+    def _pick_files(self, title: str) -> list[str]:
+        start = self.settings.value("last_dir", str(Path.home()))
+        paths, _ = QFileDialog.getOpenFileNames(self, title, start, FILE_FILTER)
+        if paths:
+            self.settings.setValue("last_dir", str(Path(paths[0]).parent))
+        return paths
+
+    def open_files(self, paths: list[str] | None = None) -> None:
+        if not self._confirm_discard():
+            return
+        paths = paths if paths is not None else self._pick_files("Belge aç")
+        if not paths:
+            return
+        self.doc = Document()
+        self.doc_path = None
+        self._thumb_cache.clear()
+        self._view_cache = None
+        self.table_editor.set_tables([])
+        self.add_files(paths)
+        self.doc.modified = False
+        self.doc._undo.clear()
+        if len(paths) == 1 and loader.is_pdf(paths[0]):
+            self.doc_path = Path(paths[0]).resolve()
+        self._refresh_all()
+
+    def add_pages_dialog(self) -> None:
+        paths = self._pick_files("Eklenecek dosyaları seç")
+        if paths:
+            self.add_files(paths)
+
+    def add_files(self, paths: list[str]) -> None:
+        added = []
+        for path in paths:
+            if not loader.is_supported(path) or not Path(path).is_file():
+                continue
+            try:
+                added += self.doc.add_file(path)
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(self, APP_NAME, f"{Path(path).name} açılamadı:\n{exc}")
+        if added:
+            self._rebuild_thumbs(select=[added[0]], current=added[0])
+            self._show_current()
+            self._update_title()
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        if self.doc.pages:
+            self.add_files(paths)
+        else:
+            self.open_files(paths)
+
+    def _save_path(self, title: str, suffix: str, filt: str, default_stem: str | None = None) -> str | None:
+        base = self.doc_path or (self.doc.sources[0] if self.doc.sources else Path.home() / "belge")
+        folder = self.settings.value("save_dir", str(base.parent))
+        default = str(Path(folder) / ((default_stem or base.stem) + suffix))
+        out, _ = QFileDialog.getSaveFileName(self, title, default, filt)
+        if out:
+            self.settings.setValue("save_dir", str(Path(out).parent))
+        return out or None
+
+    def _saved(self, out: str | Path, what: str) -> None:
+        self.statusBar().showMessage(f"{what} kaydedildi: {out}", 10000)
+        box = QMessageBox(self)
+        box.setWindowTitle(APP_NAME)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(f"{what} kaydedildi:\n{out}")
+        open_btn = box.addButton("Dosyayı Aç", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Kapat", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(out)))
+
+    def save(self) -> None:
+        if self.doc_path is None:
+            self.save_as()
+        else:
+            self._write_pdf(self.doc_path)
+
+    def save_as(self) -> None:
+        out = self._save_path("PDF olarak kaydet", ".pdf", "PDF (*.pdf)")
+        if out:
+            self._write_pdf(Path(out))
+
+    def _write_pdf(self, out: Path) -> None:
+        pages = list(self.doc.pages)
+
+        def done(path):
+            # Reload from the saved file so page indices match the new PDF,
+            # keeping recognition results (rotation is now baked in).
+            new_doc = Document()
+            for i, old in enumerate(pages):
+                item = PageItem(Path(path).resolve(), i, 0, old.ocr, old.edited_text, old.tables,
+                                old.ai_text, old.ai_tables)
+                new_doc.pages.append(item)
+            cur = self.thumbs.currentRow()
+            self.doc = new_doc
+            self.doc_path = Path(path).resolve()
+            self._thumb_cache.clear()
+            self._view_cache = None
+            self._rebuild_thumbs(select=[], current=new_doc.pages[max(0, min(cur, len(new_doc.pages) - 1))])
+            self._show_current()
+            self._update_title()
+            self.statusBar().showMessage(f"Kaydedildi: {path}", 8000)
+
+        self._start(build_pdf, pages, out, on_done=done)
+
+    def export_selected(self) -> None:
+        pages = self.selected_pages()
+        if not pages:
+            return
+        out = self._save_path("Seçili sayfaları kaydet", "_secilen.pdf", "PDF (*.pdf)")
+        if out:
+            self._start(build_pdf, pages, out, on_done=lambda p: self._saved(p, f"{len(pages)} sayfalık PDF"))
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        if not self._confirm_discard():
+            event.ignore()
+            return
+        if self.worker:
+            self.worker.cancel()
+            self.pool.waitForDone(5000)
+        super().closeEvent(event)
+
+    # ---------------------------------------------------------- page ops
+    def thumbs_select_all(self) -> None:
+        self.thumbs.selectAll()
+
+    def _on_reorder(self) -> None:
+        by_id = {id(p): p for p in self.doc.pages}
+        order = [by_id[self.thumbs.item(i).data(Qt.ItemDataRole.UserRole)] for i in range(self.thumbs.count())]
+        self.doc.reorder(order)
+        self._refresh_labels()
+        self._update_title()
+        self._update_actions()
+        self._invalidate_tables()
+
+    def rotate(self, degrees: int) -> None:
+        pages = self.selected_pages()
+        if not pages or self._busy():
+            return
+        self.doc.rotate(pages, degrees)
+        self._view_cache = None
+        self._rebuild_thumbs(select=pages)
+        self._show_current()
+        self._update_title()
+        self._invalidate_tables()
+
+    def delete_pages(self) -> None:
+        pages = self.selected_pages()
+        if not pages or self._busy():
+            return
+        if len(pages) == len(self.doc.pages):
+            QMessageBox.warning(self, APP_NAME, "Belgedeki tüm sayfalar silinemez.")
+            return
+        row = self.doc.position(pages[0])
+        self.doc.delete(pages)
+        nxt = self.doc.pages[min(row, len(self.doc.pages) - 1)]
+        self._rebuild_thumbs(select=[nxt], current=nxt)
+        self._show_current()
+        self._update_title()
+        self._invalidate_tables()
+        self.statusBar().showMessage(f"{len(pages)} sayfa silindi (Geri Al: Ctrl+Z)", 5000)
+
+    def undo(self) -> None:
+        if self._busy() or not self.doc.can_undo:
+            return
+        self.doc.undo()
+        self._view_cache = None
+        self._rebuild_thumbs(select=[])
+        self._show_current()
+        self._update_title()
+        self._invalidate_tables()
+
+    def _invalidate_tables(self) -> None:
+        self._load_tables_from_pages()
+
+    def _load_tables_from_pages(self) -> None:
+        found = self.doc.all_tables()
+        if sd.value(self.settings, "merge_tables"):
+            found = tables.merge_tables(found)
+        self.table_editor.set_tables(found)
 
     # ------------------------------------------------------------- tasks
     def _start(self, fn: Callable, *args, on_done: Callable, **kwargs) -> None:
@@ -428,6 +666,7 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.progress.setVisible(False)
         self.cancel_btn.setVisible(False)
+        self._refresh_labels()
         self._update_actions()
 
     def _finish(self, on_done: Callable, result) -> None:
@@ -441,11 +680,13 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, msg: str) -> None:
         self._end()
+        self._show_current()
         self.statusBar().showMessage("Hata")
         QMessageBox.critical(self, APP_NAME, f"İşlem başarısız oldu:\n{msg}")
 
     def _on_cancelled(self) -> None:
         self._end()
+        self._show_current()
         self.statusBar().showMessage("İşlem iptal edildi", 5000)
 
     def _cancel_worker(self) -> None:
@@ -453,147 +694,192 @@ class MainWindow(QMainWindow):
             self.worker.cancel()
             self.statusBar().showMessage("İptal ediliyor...")
 
-    def closeEvent(self, event) -> None:  # noqa: N802
-        if self.worker:
-            self.worker.cancel()
-            self.pool.waitForDone(5000)
-        super().closeEvent(event)
+    # ------------------------------------------------------ recognition
+    @staticmethod
+    def _ocr_job(items, options, force, progress=None, cancel=None):
+        todo = [i for i in items if force or (i.ocr is None and i.edited_text is None)]
+        for n, item in enumerate(todo):
+            if cancel():
+                raise ocr.Cancelled()
+            progress(n, len(todo), f"Metin tanınıyor: sayfa {n + 1}/{len(todo)}")
+            item.ocr = ocr.ocr_image(item.image(options.dpi), options)
+            item.edited_text = None
+            item.ai_text = False
+        progress(len(todo), len(todo), "Tamamlandı")
+        return len(todo)
 
-    # ---------------------------------------------------------- actions
-    def run_ocr(self, then: Callable[[], None] | None = None) -> None:
-        path = self.current_file()
-        if not path:
+    @staticmethod
+    def _tables_job(items, options, borderless, progress=None, cancel=None):
+        for n, item in enumerate(items):
+            if cancel():
+                raise ocr.Cancelled()
+            progress(n, len(items), f"Tablolar aranıyor: sayfa {n + 1}/{len(items)}")
+            item.tables = tables.extract_tables(item.image(options.dpi), options, borderless)
+            item.ai_tables = False
+        progress(len(items), len(items), "Tamamlandı")
+        return sum(len(i.tables or []) for i in items)
+
+    @staticmethod
+    def _ai_job(items, settings, progress=None, cancel=None):
+        for n, item in enumerate(items):
+            if cancel():
+                raise ocr.Cancelled()
+            progress(n, len(items), f"Yapay zekâ inceliyor: sayfa {n + 1}/{len(items)}")
+            result = ai.analyze_page(item.image(200), settings)
+            item.edited_text = result.text
+            item.ai_text = True
+            item.tables = [tables.Table.from_grid(rows, source="ai") for rows in result.tables]
+            item.ai_tables = True
+        progress(len(items), len(items), "Tamamlandı")
+        return len(items)
+
+    def run_ocr(self, then: Callable[[], None] | None = None, force: bool = True) -> None:
+        if not self.doc.pages or self._busy():
             return
 
-        def done(pages):
-            self.results[path] = pages
-            self.edits = {k: v for k, v in self.edits.items() if k[0] != path}
-            mean = sum(p.confidence for p in pages) / max(len(pages), 1)
-            self.statusBar().showMessage(f"{len(pages)} sayfa tanındı, ortalama güven %{mean:.0f}", 8000)
-            if self.current_file() == path:
-                self._show_page_text()
+        def done(count):
+            self._show_current()
+            self.side_tabs.setCurrentIndex(0)
+            self.statusBar().showMessage(f"{count} sayfanın metni tanındı", 8000)
             if callable(then):
                 then()
 
-        self._start(ocr.ocr_file, path, self.options(), on_done=done)
+        self._start(self._ocr_job, list(self.doc.pages), self.options(), force, on_done=done)
 
-    def _pages_for_export(self, path: str) -> list[ocr.OcrPage]:
-        pages = self.results[path]
-        return [
-            page_from_text(page, self.edits[(path, i)]) if (path, i) in self.edits else page
-            for i, page in enumerate(pages)
-        ]
+    def run_tables(self, then: Callable[[], None] | None = None) -> None:
+        if not self.doc.pages or self._busy():
+            return
 
-    def _save_path(self, title: str, suffix: str, filt: str) -> str | None:
-        path = self.current_file()
-        default_dir = self.settings.value("save_dir", str(Path(path).parent))
-        default = str(Path(default_dir) / (Path(path).stem + suffix))
-        out, _ = QFileDialog.getSaveFileName(self, title, default, filt)
-        if out:
-            self.settings.setValue("save_dir", str(Path(out).parent))
-        return out or None
+        def done(count):
+            self._load_tables_from_pages()
+            self.side_tabs.setCurrentIndex(1)
+            n = len(self.table_editor.tables())
+            self.statusBar().showMessage(f"{n} tablo bulundu", 8000)
+            if callable(then):
+                then()
 
-    def _saved(self, out: str | Path, what: str) -> None:
-        self.statusBar().showMessage(f"{what} kaydedildi: {out}", 10000)
-        box = QMessageBox(self)
-        box.setWindowTitle(APP_NAME)
-        box.setText(f"{what} kaydedildi:\n{out}")
-        open_btn = box.addButton("Dosyayı Aç", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("Kapat", QMessageBox.ButtonRole.RejectRole)
-        box.exec()
-        if box.clickedButton() is open_btn:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(out)))
+        self._start(self._tables_job, list(self.doc.pages), self.options(),
+                    sd.value(self.settings, "borderless"), on_done=done)
 
-    def _with_ocr(self, fn: Callable[[], None]) -> None:
-        if self.current_file() in self.results:
-            fn()
-        else:
-            self.run_ocr(then=fn)
+    def run_ai(self, selected_only: bool = False) -> None:
+        if not self.doc.pages or self._busy():
+            return
+        settings = sd.ai_settings(self.settings)
+        if not settings.configured:
+            QMessageBox.information(
+                self, APP_NAME,
+                "Yapay zekâ özelliğini kullanmak için bir API anahtarı girmeniz gerekiyor.\n"
+                "Ayarlar penceresi açılıyor.")
+            if not self.open_settings(tab=1):
+                return
+            settings = sd.ai_settings(self.settings)
+            if not settings.configured:
+                return
+        pages = self.selected_pages() if selected_only else list(self.doc.pages)
 
+        def done(count):
+            self._load_tables_from_pages()
+            self._show_current()
+            n = len(self.table_editor.tables())
+            if n:
+                self.side_tabs.setCurrentIndex(1)
+            self.statusBar().showMessage(
+                f"Yapay zekâ {count} sayfayı inceledi, {n} tablo hazır. Kontrol edip düzenleyebilirsiniz.", 10000)
+
+        self._start(self._ai_job, pages, settings, on_done=done)
+
+    # ------------------------------------------------------------ export
     def export_word(self) -> None:
-        if not self.current_file():
+        if not self.doc.pages:
             return
         out = self._save_path("Word olarak kaydet", ".docx", "Word belgesi (*.docx)")
         if not out:
             return
-        path = self.current_file()
 
         def write():
             try:
-                export_docx.export_docx(self._pages_for_export(path), out)
+                export_docx.export_docx([p.export_page() for p in self.doc.pages], out)
             except Exception as exc:  # noqa: BLE001
                 self._on_error(str(exc))
                 return
             self._saved(out, "Word belgesi")
 
-        self._with_ocr(write)
+        self.run_ocr(then=write, force=False)
 
     def export_text(self) -> None:
-        if not self.current_file():
+        if not self.doc.pages:
             return
         out = self._save_path("Metin olarak kaydet", ".txt", "Metin dosyası (*.txt)")
         if not out:
             return
-        path = self.current_file()
 
         def write():
-            export_docx.export_txt(self._pages_for_export(path), out)
+            export_docx.export_txt([p.export_page() for p in self.doc.pages], out)
             self._saved(out, "Metin dosyası")
 
-        if path in self.results:
+        if self.ocr_available:
+            self.run_ocr(then=write, force=False)
+        else:
             write()
-        elif self.ocr_available:
-            self.run_ocr(then=write)
 
-    def make_searchable(self) -> None:
-        path = self.current_file()
-        if not path:
+    def export_searchable(self) -> None:
+        if not self.doc.pages:
             return
         out = self._save_path("Aranabilir PDF kaydet", "_aranabilir.pdf", "PDF (*.pdf)")
         if not out:
             return
-        if Path(out).resolve() == Path(path).resolve():
+        if any(Path(out).resolve() == s for s in self.doc.sources):
             QMessageBox.warning(self, APP_NAME, "Kaynak dosyanın üzerine yazılamaz. Farklı bir ad seçin.")
             return
-        self._start(
-            ocr.make_searchable_pdf, path, out, self.options(),
-            skip_text_pages=self.skiptext_box.isChecked(),
-            on_done=lambda result: self._saved(result, "Aranabilir PDF"),
-        )
+        self._start(build_pdf, list(self.doc.pages), out, True, self.options(),
+                    sd.value(self.settings, "skip_text"),
+                    on_done=lambda p: self._saved(p, "Aranabilir PDF"))
 
     def export_excel(self) -> None:
-        path = self.current_file()
-        if not path:
+        if not self.doc.pages:
             return
         out = self._save_path("Tabloları Excel'e kaydet", ".xlsx", "Excel çalışma kitabı (*.xlsx)")
         if not out:
             return
 
-        def done(found):
+        def write():
+            found = self.table_editor.tables()
             if not found:
                 QMessageBox.information(self, APP_NAME, "Belgede tablo bulunamadı.")
                 return
-            tables.export_xlsx(found, out)
+            try:
+                tables.export_xlsx(found, out)
+            except Exception as exc:  # noqa: BLE001
+                self._on_error(str(exc))
+                return
             self._saved(out, f"{len(found)} tablo içeren Excel dosyası")
 
-        self._start(
-            tables.extract_tables_from_file, path, self.options(),
-            borderless=self.borderless_box.isChecked(), on_done=done,
-        )
+        if any(p.tables is not None for p in self.doc.pages) or self.table_editor.tables():
+            write()
+        else:
+            self.run_tables(then=write)
 
-    def open_pdf_tools(self) -> None:
-        files = [self.file_list.item(i).data(Qt.ItemDataRole.UserRole)
-                 for i in range(self.file_list.count())]
-        dialog = PdfToolsDialog(self, files, self.settings)
-        dialog.exec()
-        if dialog.created:
-            self.add_files([str(p) for p in dialog.created if loader.is_supported(p)][:20])
+    # ------------------------------------------------------------- misc
+    def open_settings(self, tab: int = 0) -> bool:
+        old_merge = sd.value(self.settings, "merge_tables")
+        dlg = SettingsDialogProxy(self, tab)
+        accepted = dlg.exec() == SettingsDialogProxy.DialogCode.Accepted
+        if accepted:
+            self.apply_theme()
+            if old_merge != sd.value(self.settings, "merge_tables"):
+                self._load_tables_from_pages()
+        return accepted
 
     def about(self) -> None:
         QMessageBox.about(
-            self,
-            f"{APP_NAME} hakkında",
-            f"<b>{APP_NAME} {__version__}</b><br>"
-            "Taranmış belgelerden metin tanıma, aranabilir PDF, Word ve Excel'e aktarma, "
-            "PDF düzenleme.<br><br>OCR motoru: Tesseract (Apache 2.0)",
+            self, f"{APP_NAME} hakkında",
+            f"<h3>{APP_NAME} {__version__}</h3>"
+            "<p>Taranmış belgelerden metin ve tablo tanıma, yapay zekâ destekli analiz, "
+            "Word/Excel/aranabilir PDF dışa aktarma ve PDF sayfa düzenleme.</p>"
+            "<p>OCR motoru: Tesseract (Apache 2.0)</p>",
         )
+
+
+class SettingsDialogProxy(sd.SettingsDialog):
+    def __init__(self, window: MainWindow, tab: int):
+        super().__init__(window, window.settings, window.languages, tab)
